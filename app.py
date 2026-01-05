@@ -1,89 +1,157 @@
+import streamlit as st
 import os
 import tempfile
-
-import streamlit as st
+import time
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
-from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# 1. Configuration de la page
-st.set_page_config(page_title="Chat avec tes PDF (Local & Privé)", page_icon="🔒")
-st.title("🔒 RAG Cybersécurité : Analyse de PDF en Local")
-st.markdown("Ce projet utilise **Ollama (Mistral)** pour analyser des documents sensibles sans connexion internet.")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Secure RAG - Assistant Documentaire", page_icon="🛡️", layout="wide")
 
-# 2. Fonction pour traiter le PDF
+# --- CSS PERSONNALISÉ (Pour faire "Pro") ---
+st.markdown("""
+<style>
+    .chat-message {padding: 1.5rem; border-radius: 0.5rem; margin-bottom: 1rem; display: flex}
+    .chat-message.user {background-color: #2b313e}
+    .chat-message.bot {background-color: #475063}
+    .source-box {font-size: 0.8em; color: #aaa; border-left: 2px solid #D4AF37; padding-left: 10px; margin-top: 5px;}
+</style>
+""", unsafe_allow_html=True)
+
+# --- FONCTIONS ---
+
+def sanitize_input(user_input):
+    """Simple filtre de sécurité pour éviter les injections basiques."""
+    blacklist = ["ignore all instructions", "system override", "delete database"]
+    for word in blacklist:
+        if word in user_input.lower():
+            return False
+    return True
+
 def process_pdf(uploaded_file):
-    # Création d'un fichier temporaire pour que PyPDFLoader puisse le lire
+    """Ingère le PDF, le découpe et crée la base vectorielle."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         tmp_path = tmp_file.name
 
-    # Chargement du PDF
     loader = PyPDFLoader(tmp_path)
     docs = loader.load()
 
-    # Découpage du texte en morceaux (Chunks)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    # Découpage intelligent (Chunks)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
     splits = text_splitter.split_documents(docs)
 
-    # Création de la base de données vectorielle (Embeddings)
-    # On utilise Ollama pour transformer le texte en vecteurs mathématiques
     embeddings = OllamaEmbeddings(model="mistral")
+    # Persist_directory est optionnel mais utile pour garder la DB sur le disque
     vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
     
-    # Nettoyage du fichier temporaire
     os.remove(tmp_path)
     return vectorstore
 
-# 3. Interface Utilisateur
-uploaded_file = st.file_uploader("Dépose ton document PDF ici", type="pdf")
-
-if uploaded_file is not None:
-    st.success("Fichier chargé ! Traitement en cours...")
+def get_response(query, vectorstore):
+    """Génère la réponse avec contexte et sources."""
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) # Récupère les 3 meilleurs passages
     
-    # Création de la base de connaissance
-    if "vectorstore" not in st.session_state:
-        with st.spinner("Indexation du document... (Cela peut prendre un peu de temps sur CPU)"):
-            st.session_state.vectorstore = process_pdf(uploaded_file)
-            st.success("Document indexé ! Tu peux poser tes questions.")
+    llm = Ollama(model="mistral")
+    
+    # Récupération des documents pertinents
+    docs = retriever.invoke(query)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+    
+    template = """
+    Tu es un analyste en cybersécurité expert. Utilise le contexte suivant pour répondre à la question.
+    Si la réponse n'est pas dans le contexte, dis simplement que tu ne sais pas.
+    Sois précis et concis.
+    
+    Contexte : {context}
+    
+    Question : {question}
+    """
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+    
+    response = chain.invoke({"context": context_text, "question": query})
+    return response, docs
 
-    # Zone de Chat
-    question = st.text_input("Pose ta question sur le document :")
+# --- INTERFACE UTILISATEUR ---
 
-    if question:
-        # 4. La partie RAG (Récupération + Génération)
-        
-        # Le modèle va chercher les morceaux pertinents dans le PDF
-        retriever = st.session_state.vectorstore.as_retriever()
-        
-        # Le modèle de langage (LLM)
-        llm = Ollama(model="mistral")
-        
-        # Le Prompt (Les instructions données à l'IA)
-        template = """Tu es un assistant expert en cybersécurité. 
-        Réponds à la question en te basant UNIQUEMENT sur le contexte fourni ci-dessous.
-        Si la réponse n'est pas dans le document, dis "Je ne sais pas".
-        
-        Contexte : {context}
-        
-        Question : {question}
-        """
-        prompt = ChatPromptTemplate.from_template(template)
-        
-        # La chaîne de traitement (Chain)
-        chain = (
-            {"context": retriever, "question": lambda x: x}
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-        
-        # Affichage de la réponse
-        with st.spinner("L'IA réfléchit..."):
-            response = chain.invoke(question)
-            st.write("### Réponse :")
-            st.write(response)
+# Sidebar (Menu latéral)
+with st.sidebar:
+    st.header("📂 Gestion des Documents")
+    uploaded_file = st.file_uploader("Upload ton PDF (Audit, Cours, Rapport)", type="pdf")
+    
+    if st.button("🧹 Effacer la mémoire & Reset"):
+        st.session_state.messages = []
+        st.session_state.vectorstore = None
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 🔒 Privacy Mode")
+    st.info("Modèle : Mistral (Local)\nDonnées : Non partagées")
+
+# Titre Principal
+st.title("🛡️ Secure RAG : Analyseur de Documents")
+
+# Initialisation de l'historique de chat
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Initialisation du vectorstore
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
+# Traitement du fichier au chargement
+if uploaded_file and st.session_state.vectorstore is None:
+    with st.spinner("🔒 Chiffrement et indexation du document en cours..."):
+        st.session_state.vectorstore = process_pdf(uploaded_file)
+        st.success("Document sécurisé et chargé en mémoire !")
+
+# Affichage des messages précédents
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "sources" in message:
+            with st.expander("🔍 Voir les sources utilisées"):
+                for idx, source in enumerate(message["sources"]):
+                    st.markdown(f"**Source {idx+1} (Page {source.metadata.get('page', '?')})** :")
+                    st.markdown(f"_{source.page_content[:200]}..._")
+
+# Zone de saisie utilisateur
+if prompt := st.chat_input("Pose ta question sur le document..."):
+    
+    # 1. Vérification Sécurité (Sanitization)
+    if not sanitize_input(prompt):
+        st.error("⚠️ ALERTE SÉCURITÉ : Tentative d'injection détectée.")
+    elif st.session_state.vectorstore is None:
+        st.warning("Merci de charger un document PDF d'abord.")
+    else:
+        # 2. Affichage immédiat du message utilisateur
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # 3. Génération de la réponse
+        with st.chat_message("assistant"):
+            with st.spinner("Analyse des vecteurs..."):
+                response_text, sources = get_response(prompt, st.session_state.vectorstore)
+                
+                st.markdown(response_text)
+                
+                # Affichage des sources dans un menu déroulant
+                with st.expander("🔍 Voir les sources (Preuve)"):
+                    for idx, source in enumerate(sources):
+                        st.markdown(f"**Source {idx+1} (Page {source.metadata.get('page', '?')})** :")
+                        st.markdown(f"_{source.page_content[:200]}..._")
+
+        # 4. Sauvegarde dans l'historique
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": response_text,
+            "sources": sources
+        })
